@@ -388,6 +388,74 @@ def maybe_send_smtp_email(to_email: str, activation_code: str):
         smtp.send_message(msg)
 
 
+def _telegram_send_message(text: str):
+    """
+    Send a Telegram message if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are present.
+    This function raises on hard failures (bad response / network errors).
+    """
+    token = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
+    chat_id = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+    if not (token and chat_id):
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    resp = requests.post(
+        url,
+        json={
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Telegram sendMessage failed (HTTP {resp.status_code}): {resp.text}")
+
+    data = {}
+    try:
+        data = resp.json()
+    except Exception:
+        pass
+    if isinstance(data, dict) and data.get("ok") is False:
+        raise RuntimeError(f"Telegram sendMessage returned ok=false: {data}")
+
+
+def maybe_send_telegram_activation_notification(
+    *,
+    activated_at: str,
+    code: str,
+    email: str,
+    success: bool,
+    invited: bool | None = None,
+    team_name: str | None = None,
+    team_id: str | None = None,
+    error: str | None = None,
+):
+    token = (os.getenv("TELEGRAM_BOT_TOKEN", "") or "").strip()
+    chat_id = (os.getenv("TELEGRAM_CHAT_ID", "") or "").strip()
+    if not (token and chat_id):
+        return
+
+    status = "SUCCESS" if success else "FAILED"
+    invited_txt = "unknown" if invited is None else ("yes" if invited else "no")
+    team_display = (team_name or "").strip() or (team_id or "").strip() or "Unknown"
+    err = (error or "").strip()
+
+    lines = [
+        "Invite attempt",
+        f"Status: {status}",
+        f"Email: {email}",
+        f"Code: {code}",
+        f"Team: {team_display}",
+        f"Invited: {invited_txt}",
+        f"Thời gian: {activated_at}",
+    ]
+    if err:
+        lines.append(f"Error: {err}")
+
+    _telegram_send_message("\n".join(lines))
+
+
 app = Flask(__name__)
 
 
@@ -405,11 +473,39 @@ def activate():
     email = (request.form.get("email") or payload.get("email") or "").strip()
 
     if not code or not email:
+        ts = utc_now_iso()
+        try:
+            maybe_send_telegram_activation_notification(
+                activated_at=ts,
+                code=code or "(missing)",
+                email=email or "(missing)",
+                success=False,
+                invited=None,
+                team_name=None,
+                team_id=None,
+                error="Thiếu code hoặc email.",
+            )
+        except Exception as err:
+            print(f"Lỗi gửi Telegram: {err}")
         return jsonify({"success": False, "error": "Thiếu code hoặc email."}), 400
 
     ws_codes, ws_acts = open_worksheets()
     row_idx, row = find_code_row(ws_codes, code)
     if not row:
+        ts = utc_now_iso()
+        try:
+            maybe_send_telegram_activation_notification(
+                activated_at=ts,
+                code=code,
+                email=email,
+                success=False,
+                invited=None,
+                team_name=None,
+                team_id=None,
+                error="Code không tồn tại.",
+            )
+        except Exception as err:
+            print(f"Lỗi gửi Telegram: {err}")
         return jsonify({"success": False, "error": "Code không tồn tại."}), 404
 
     ts = utc_now_iso()
@@ -429,6 +525,19 @@ def activate():
 
     if existing_email:
         if existing_email.lower() != email.lower():
+            try:
+                maybe_send_telegram_activation_notification(
+                    activated_at=ts,
+                    code=code,
+                    email=email,
+                    success=False,
+                    invited=None,
+                    team_name=None,
+                    team_id=None,
+                    error="Code đã được gán cho email khác.",
+                )
+            except Exception as err:
+                print(f"Lỗi gửi Telegram: {err}")
             return jsonify({"success": False, "error": "Code đã được gán cho email khác."}), 409
 
     activated_dt = parse_iso_dt(existing_activated_raw)
@@ -439,6 +548,19 @@ def activate():
     if expires_dt and now_dt > expires_dt:
         ws_codes.update_cell(row_idx, cols["status"], "expired")
         ws_codes.update_cell(row_idx, cols["error"], f"expired_at={expires_dt.isoformat(timespec='seconds')}")
+        try:
+            maybe_send_telegram_activation_notification(
+                activated_at=ts,
+                code=code,
+                email=email,
+                success=False,
+                invited=False,
+                team_name=None,
+                team_id=None,
+                error="Code đã hết hạn.",
+            )
+        except Exception as err:
+            print(f"Lỗi gửi Telegram: {err}")
         return jsonify({"success": False, "error": "Code đã hết hạn."}), 410
 
     try:
@@ -473,6 +595,10 @@ def activate():
         cells_to_update.append(gspread.Cell(row=row_idx, col=cols["error"], value=""))
         
         ws_codes.update_cells(cells_to_update)
+
+        telegram_success = True
+        telegram_invited = True
+        telegram_error = ""
 
     except Exception as e:
         cells_to_update = []
@@ -509,6 +635,10 @@ def activate():
             "tried": []
         }
 
+        telegram_success = False
+        telegram_invited = False
+        telegram_error = str(e)
+
     import threading
     def send_email_async(to_email, act_code):
         try:
@@ -516,7 +646,23 @@ def activate():
         except Exception as err:
             print(f"Lỗi gửi email: {err}")
 
+    def send_telegram_async():
+        try:
+            maybe_send_telegram_activation_notification(
+                activated_at=ts,
+                code=code,
+                email=email,
+                success=telegram_success,
+                invited=telegram_invited,
+                team_name=team_name,
+                team_id=team_id,
+                error=telegram_error,
+            )
+        except Exception as err:
+            print(f"Lỗi gửi Telegram: {err}")
+
     threading.Thread(target=send_email_async, args=(email, code), daemon=True).start()
+    threading.Thread(target=send_telegram_async, daemon=True).start()
 
     return jsonify(
         {

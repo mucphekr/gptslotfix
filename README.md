@@ -41,6 +41,9 @@ Tạo Google Service Account, tải file JSON và **share Google Sheet** cho ema
   - `GOOGLE_SERVICE_ACCOUNT_JSON` (đường dẫn file JSON)
   - (deploy Railway khuyến nghị) `GOOGLE_SERVICE_ACCOUNT_JSON_CONTENT` (dán toàn bộ nội dung JSON service account)
   - `GOOGLE_SHEET_ID` (ID của sheet trên URL)
+  - (tuỳ chọn) Telegram notify mỗi lần kích hoạt:
+    - `TELEGRAM_BOT_TOKEN`
+    - `TELEGRAM_CHAT_ID`
   - (tuỳ chọn) SMTP nếu muốn gửi email xác nhận
 
 ### 3) Chạy
